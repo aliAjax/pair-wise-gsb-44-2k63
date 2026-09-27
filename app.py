@@ -17,6 +17,7 @@ DEFAULT_DB = ROOT / "privacy_requests.db"
 REQUEST_TYPES = {"access", "correction", "deletion", "withdraw_consent", "restriction"}
 OPEN_STATUSES = {"received", "verifying", "processing", "extended", "response_ready"}
 FINAL_STATUSES = {"fulfilled", "rejected", "duplicate"}
+ESCALATION_OPEN_STATUSES = ("open", "submitted")
 
 
 class DomainError(Exception):
@@ -78,6 +79,7 @@ class PrivacyRequestService:
                     max_extension_days INTEGER NOT NULL,
                     minor_guardian_required INTEGER NOT NULL,
                     agent_authority_required INTEGER NOT NULL,
+                    escalation_threshold_days INTEGER NOT NULL DEFAULT 0,
                     updated_by TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -138,10 +140,35 @@ class PrivacyRequestService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS escalations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id INTEGER NOT NULL REFERENCES requests(id),
+                    jurisdiction TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    overdue_days_at_open INTEGER NOT NULL,
+                    disposition_note TEXT,
+                    responsible_person TEXT,
+                    planned_completion_date TEXT,
+                    submitted_by TEXT,
+                    submitted_at TEXT,
+                    review_note TEXT,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_escalations_unclosed ON escalations(request_id) WHERE status != 'closed';
+                CREATE INDEX IF NOT EXISTS idx_escalations_status ON escalations(status,jurisdiction);
                 CREATE INDEX IF NOT EXISTS idx_requests_due ON requests(status,due_date);
                 CREATE INDEX IF NOT EXISTS idx_requests_subject ON requests(subject_id,request_type,submitted_at);
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(jurisdictions)").fetchall()}
+        if "escalation_threshold_days" not in columns:
+            conn.execute("ALTER TABLE jurisdictions ADD COLUMN escalation_threshold_days INTEGER NOT NULL DEFAULT 0")
 
     def _audit(self, conn: sqlite3.Connection, request_id: int | None, actor: str,
                action: str, details: dict[str, Any]) -> None:
@@ -153,26 +180,31 @@ class PrivacyRequestService:
     def configure_jurisdiction(self, actor: str, role: str, code: str, name: str,
                                response_days: int, max_extension_days: int,
                                minor_guardian_required: bool = True,
-                               agent_authority_required: bool = True) -> dict[str, Any]:
+                               agent_authority_required: bool = True,
+                               escalation_threshold_days: int = 0) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "配置地区规则")
         code, name = code.strip().upper(), name.strip()
         try:
             response_days, max_extension_days = int(response_days), int(max_extension_days)
+            escalation_threshold_days = int(escalation_threshold_days)
         except (TypeError, ValueError) as exc:
             raise DomainError("时限必须是整数") from exc
-        if not code or not name or not 1 <= response_days <= 180 or not 0 <= max_extension_days <= 180:
+        if (not code or not name or not 1 <= response_days <= 180
+                or not 0 <= max_extension_days <= 180 or not 0 <= escalation_threshold_days <= 180):
             raise DomainError("地区规则参数无效")
         with self.connect() as conn:
             conn.execute(
-                """INSERT INTO jurisdictions(code,name,response_days,max_extension_days,minor_guardian_required,agent_authority_required,updated_by,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?)
+                """INSERT INTO jurisdictions(code,name,response_days,max_extension_days,minor_guardian_required,agent_authority_required,escalation_threshold_days,updated_by,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(code) DO UPDATE SET name=excluded.name,response_days=excluded.response_days,
                    max_extension_days=excluded.max_extension_days,minor_guardian_required=excluded.minor_guardian_required,
-                   agent_authority_required=excluded.agent_authority_required,updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
-                (code, name, response_days, max_extension_days, int(bool(minor_guardian_required)), int(bool(agent_authority_required)), actor, utcnow()),
+                   agent_authority_required=excluded.agent_authority_required,escalation_threshold_days=excluded.escalation_threshold_days,
+                   updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
+                (code, name, response_days, max_extension_days, int(bool(minor_guardian_required)),
+                 int(bool(agent_authority_required)), escalation_threshold_days, actor, utcnow()),
             )
-            self._audit(conn, None, actor, "jurisdiction.configured", {"code": code})
+            self._audit(conn, None, actor, "jurisdiction.configured", {"code": code, "escalation_threshold_days": escalation_threshold_days})
             return dict(conn.execute("SELECT * FROM jurisdictions WHERE code=?", (code,)).fetchone())
 
     def create_subject(self, actor: str, role: str, subject_ref: str, region: str,
@@ -454,6 +486,149 @@ class PrivacyRequestService:
             self._audit(conn, request_id, actor, "request.rejected", {"reason": reason.strip()})
             return dict(self._request(conn, request_id))
 
+    @staticmethod
+    def _overdue_days(due_date: str, now: datetime) -> int:
+        return max(0, int((now - parse_time(due_date)).total_seconds() // 86400))
+
+    def _sweep_escalations(self, conn: sqlite3.Connection) -> None:
+        """Open escalations for requests past their jurisdiction escalation threshold."""
+        now = datetime.now(timezone.utc)
+        placeholders = ",".join("?" for _ in OPEN_STATUSES)
+        rows = conn.execute(
+            """SELECT r.id, r.due_date, r.jurisdiction, j.escalation_threshold_days AS threshold
+               FROM requests r JOIN jurisdictions j ON j.code = r.jurisdiction
+               WHERE r.status IN (%s)""" % placeholders,
+            tuple(sorted(OPEN_STATUSES)),
+        ).fetchall()
+        for row in rows:
+            overdue_seconds = (now - parse_time(row["due_date"])).total_seconds()
+            if overdue_seconds <= 0 or int(overdue_seconds // 86400) < row["threshold"]:
+                continue
+            unclosed = conn.execute(
+                "SELECT id FROM escalations WHERE request_id=? AND status != 'closed'", (row["id"],),
+            ).fetchone()
+            if unclosed:
+                continue
+            last_closed = conn.execute(
+                """SELECT planned_completion_date FROM escalations
+                   WHERE request_id=? AND status='closed' ORDER BY id DESC LIMIT 1""",
+                (row["id"],),
+            ).fetchone()
+            if (last_closed and last_closed["planned_completion_date"]
+                    and parse_time(last_closed["planned_completion_date"]) > now):
+                continue
+            overdue_days = int(overdue_seconds // 86400)
+            cur = conn.execute(
+                """INSERT INTO escalations(request_id,jurisdiction,status,overdue_days_at_open,created_at)
+                   VALUES(?,?,?,?,?)""",
+                (row["id"], row["jurisdiction"], "open", overdue_days, utcnow()),
+            )
+            self._audit(conn, row["id"], "system", "escalation.opened",
+                        {"escalation_id": cur.lastrowid, "overdue_days": overdue_days,
+                         "threshold_days": row["threshold"]})
+
+    def _escalation(self, conn: sqlite3.Connection, escalation_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM escalations WHERE id=?", (escalation_id,)).fetchone()
+        if not row:
+            raise DomainError("升级单不存在", 404)
+        return row
+
+    def submit_escalation(self, actor: str, role: str, escalation_id: int, disposition_note: str,
+                          responsible_person: str, planned_completion_date: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "提交升级处置")
+        if not disposition_note.strip() or not responsible_person.strip() or not planned_completion_date.strip():
+            raise DomainError("处置说明、责任人和计划完成日不能为空")
+        planned = parse_time(planned_completion_date.strip()).isoformat(timespec="seconds")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            esc = self._escalation(conn, escalation_id)
+            req = self._request(conn, esc["request_id"])
+            self._can_process(actor, role, req, "提交升级处置")
+            if esc["status"] != "open":
+                raise DomainError("升级单已提交或已关闭，不能重复提交", 409)
+            cur = conn.execute(
+                """UPDATE escalations SET status='submitted',disposition_note=?,responsible_person=?,
+                   planned_completion_date=?,submitted_by=?,submitted_at=?,version=version+1
+                   WHERE id=? AND status='open'""",
+                (disposition_note.strip(), responsible_person.strip(), planned, actor, utcnow(), escalation_id),
+            )
+            if cur.rowcount != 1:
+                raise DomainError("升级单已提交或已关闭，不能重复提交", 409)
+            self._audit(conn, esc["request_id"], actor, "escalation.submitted",
+                        {"escalation_id": escalation_id, "responsible_person": responsible_person.strip(),
+                         "planned_completion_date": planned})
+            return dict(self._escalation(conn, escalation_id))
+
+    def close_escalation(self, actor: str, role: str, escalation_id: int,
+                         review_note: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "复核关闭升级单")
+        if not review_note.strip():
+            raise DomainError("复核意见不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            esc = self._escalation(conn, escalation_id)
+            if esc["status"] == "closed":
+                raise DomainError("升级单已关闭", 409)
+            if esc["status"] != "submitted":
+                raise DomainError("升级单尚未提交处置说明，不能复核关闭", 409)
+            cur = conn.execute(
+                """UPDATE escalations SET status='closed',review_note=?,reviewed_by=?,reviewed_at=?,version=version+1
+                   WHERE id=? AND status='submitted'""",
+                (review_note.strip(), actor, utcnow(), escalation_id),
+            )
+            if cur.rowcount != 1:
+                raise DomainError("升级单状态已变化，请刷新后重试", 409)
+            self._audit(conn, esc["request_id"], actor, "escalation.closed",
+                        {"escalation_id": escalation_id, "review_note": review_note.strip()})
+            return dict(self._escalation(conn, escalation_id))
+
+    def _escalation_visibility(self, actor: str, role: str, conn: sqlite3.Connection,
+                               include_closed: bool = False) -> list[sqlite3.Row]:
+        where = "" if include_closed else "WHERE e.status != 'closed'"
+        order = "ORDER BY e.status != 'open', r.due_date, e.id"
+        base = """SELECT e.*, r.request_no, r.request_type, r.status AS request_status, r.due_date,
+                  r.assigned_to FROM escalations e JOIN requests r ON r.id = e.request_id"""
+        if role in {"supervisor", "auditor"}:
+            return conn.execute("%s %s %s" % (base, where, order)).fetchall()
+        if role == "privacy_officer":
+            clause = "r.assigned_to=? AND e.status != 'closed'" if not include_closed else "r.assigned_to=?"
+            return conn.execute("%s WHERE %s %s" % (base, clause, order), (actor,)).fetchall()
+        return []
+
+    def escalation_board(self, actor: str, role: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._sweep_escalations(conn)
+            rows = self._escalation_visibility(actor, role, conn)
+            now = datetime.now(timezone.utc)
+            escalations = []
+            for row in rows:
+                item = dict(row)
+                item["overdue_days"] = self._overdue_days(item["due_date"], now)
+                escalations.append(item)
+            summary = self._escalation_summary(conn, actor, role, now)
+            return {"escalations": escalations, "summary": summary}
+
+    def _escalation_summary(self, conn: sqlite3.Connection, actor: str, role: str,
+                            now: datetime) -> list[dict[str, Any]]:
+        rows = self._escalation_visibility(actor, role, conn, include_closed=True)
+        regions: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            item = regions.setdefault(row["jurisdiction"], {
+                "jurisdiction": row["jurisdiction"], "open": 0, "submitted": 0,
+                "closed": 0, "max_overdue_days": 0,
+            })
+            if row["status"] == "closed":
+                item["closed"] += 1
+            else:
+                item[row["status"]] += 1
+                item["max_overdue_days"] = max(item["max_overdue_days"],
+                                               self._overdue_days(row["due_date"], now))
+        return [regions[code] for code in sorted(regions)]
+
+
     def _visibility(self, actor: str, role: str, conn: sqlite3.Connection) -> list[sqlite3.Row]:
         if role in {"supervisor", "auditor"}:
             return conn.execute("SELECT * FROM requests ORDER BY due_date,id").fetchall()
@@ -477,7 +652,8 @@ class PrivacyRequestService:
                 raise DomainError("无权查看该权利请求", 403)
             locations = [dict(r) for r in conn.execute("SELECT * FROM data_locations WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
-            return {"request": dict(req), "locations": locations, "timeline": timeline}
+            escalations = [dict(r) for r in conn.execute("SELECT * FROM escalations WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
+            return {"request": dict(req), "locations": locations, "timeline": timeline, "escalations": escalations}
 
     def queue(self, actor: str, role: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -492,17 +668,28 @@ class PrivacyRequestService:
 
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._sweep_escalations(conn)
             rows = self._visibility(actor, role, conn)
             requests = []
             locations = []
+            now = datetime.now(timezone.utc)
             for row in rows:
                 item = dict(row)
-                item["overdue"] = parse_time(item["due_date"]) < datetime.now(timezone.utc) and item["status"] in OPEN_STATUSES
+                item["overdue"] = parse_time(item["due_date"]) < now and item["status"] in OPEN_STATUSES
                 requests.append(item)
                 locations.extend(dict(r) for r in conn.execute("SELECT * FROM data_locations WHERE request_id=? ORDER BY id", (row["id"],)).fetchall())
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
             jurisdictions = [dict(r) for r in conn.execute("SELECT * FROM jurisdictions ORDER BY code").fetchall()]
-        return {"requests": requests, "locations": locations, "timeline": timeline, "jurisdictions": jurisdictions, "access_limited": not bool(requests)}
+            escalations = []
+            for row in self._escalation_visibility(actor, role, conn):
+                item = dict(row)
+                item["overdue_days"] = self._overdue_days(item["due_date"], now)
+                escalations.append(item)
+            escalation_summary = self._escalation_summary(conn, actor, role, now)
+        return {"requests": requests, "locations": locations, "timeline": timeline,
+                "jurisdictions": jurisdictions, "escalations": escalations,
+                "escalation_summary": escalation_summary, "access_limited": not bool(requests)}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -560,6 +747,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, self.service.state(actor, role))
             elif path == "/api/queue":
                 self._send(200, {"queue": self.service.queue(actor, role)})
+            elif path == "/api/escalations":
+                self._send(200, self.service.escalation_board(actor, role))
             elif path.startswith("/api/requests/"):
                 self._send(200, self.service.get_request(actor, role, int(path.split("/")[3])))
             else:
@@ -594,6 +783,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.fulfill_request(actor, role, **data)
             elif path == "/api/requests/reject":
                 result = self.service.reject_request(actor, role, **data)
+            elif path == "/api/escalations/submit":
+                result = self.service.submit_escalation(actor, role, **data)
+            elif path == "/api/escalations/close":
+                result = self.service.close_escalation(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
