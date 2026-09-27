@@ -1,6 +1,275 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>个人数据权利请求</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#263842}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d4dde2;padding:7px}th{background:#eef5f5}.card{background:#eef8f7;border-left:5px solid #2d827b;padding:12px 16px}code{background:#edf1f2;padding:2px 5px}.overdue{color:#a11b1b;font-weight:600}</style>
-<h1>个人数据权利请求处理</h1><div class="card">请求和位置按角色过滤。页面不展示联系方式明文。写接口需要 <code>X-User</code>、<code>X-Role</code>，详见 README。</div>
-<h2>处理队列</h2><table id="requests"><thead><tr><th>请求号</th><th>类型</th><th>地区</th><th>状态</th><th>到期日</th><th>处理人</th></tr></thead><tbody></tbody></table>
-<h2>数据定位</h2><table id="locations"><thead><tr><th>请求</th><th>系统</th><th>类别</th><th>状态</th><th>法律保留</th></tr></thead><tbody></tbody></table>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#requests tbody').innerHTML=d.requests.map(r=>`<tr class="${r.overdue?'overdue':''}"><td>${r.request_no}</td><td>${r.request_type}</td><td>${r.jurisdiction}</td><td>${r.status}</td><td>${r.due_date}</td><td>${r.assigned_to||''}</td></tr>`).join('');document.querySelector('#locations tbody').innerHTML=d.locations.map(r=>`<tr><td>${r.request_id}</td><td>${r.system_name}</td><td>${r.data_category}</td><td>${r.status}</td><td>${r.legal_hold?'是':'否'}</td></tr>`).join('')}load()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>超期升级台 · 个人数据权利请求</title>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1240px;margin:24px auto;padding:0 20px;color:#263842;background:#f7f9fa}
+table{border-collapse:collapse;width:100%;margin:12px 0;background:#fff}
+th,td{border:1px solid #d4dde2;padding:7px 9px;text-align:left;vertical-align:top}
+th{background:#eef5f5;white-space:nowrap}
+.card{background:#eef8f7;border-left:5px solid #2d827b;padding:12px 16px;margin:12px 0}
+code{background:#edf1f2;padding:2px 5px}
+.overdue{color:#a11b1b;font-weight:700}
+.badge{display:inline-block;padding:1px 9px;border-radius:10px;font-size:13px;background:#e3eaee}
+.b-open{background:#fde2e2;color:#a11b1b}.b-review{background:#fff0d6;color:#9a6200}
+.b-returned{background:#f2e4ff;color:#6a2fa0}.b-closed{background:#e4f3e6;color:#1d6b2e}
+button{cursor:pointer;border:1px solid #2d827b;background:#2d827b;color:#fff;border-radius:4px;padding:5px 12px}
+button.secondary{background:#fff;color:#2d827b}
+button:disabled{opacity:.45;cursor:not-allowed}
+input,select,textarea{font:inherit;padding:4px 7px;border:1px solid #b9c7cd;border-radius:4px}
+textarea{width:100%;min-height:52px;box-sizing:border-box}
+.row{display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin:10px 0}
+.tabbar{display:flex;gap:6px;margin:14px 0}
+.tabbar button{background:#e3eaee;color:#35505c;border-color:#c2d0d6}
+.tabbar button.active{background:#2d827b;color:#fff;border-color:#2d827b}
+.view{display:none}.view.active{display:block}
+#detail{background:#fff;border:1px solid #c2d0d6;border-radius:6px;padding:14px 18px;margin:14px 0;display:none}
+.timeline{font-size:13px;border-left:3px solid #c2d0d6;padding-left:14px}
+.timeline .ev{margin:6px 0}.muted{color:#6b7d86;font-size:13px}
+.err{color:#a11b1b}tr.clickable{cursor:pointer}tr.clickable:hover{background:#f2f9f8}
+</style>
+<h1>超期升级台</h1>
+<div class="card">主管按地区设置升级阈值；超过响应期限且未结束的请求进入升级队列，处理人提交处置说明、责任人与计划完成日，主管复核关闭后方可移出。升级记录与复核意见全程留痕。</div>
+
+<div class="row">
+  <strong>身份</strong>
+  <input id="user" placeholder="X-User" style="width:130px">
+  <select id="role">
+    <option value="supervisor">supervisor 主管</option>
+    <option value="privacy_officer">privacy_officer 处理人</option>
+    <option value="intake">intake 受理</option>
+    <option value="auditor">auditor 审计</option>
+  </select>
+  <button onclick="saveAuth();loadAll()">应用身份</button>
+  <span class="muted">写接口需要 X-User / X-Role，不展示联系方式明文</span>
+</div>
+
+<div class="tabbar">
+  <button id="tab-esc" class="active" onclick="showTab('esc')">超期升级台</button>
+  <button id="tab-queue" onclick="showTab('queue')">处理队列</button>
+</div>
+
+<div id="view-esc" class="view active">
+  <h2>地区汇总</h2>
+  <table id="regions"><thead><tr>
+    <th>地区</th><th>响应时限(天)</th><th>升级阈值(天)</th><th>已超期未结请求</th>
+    <th>待处置</th><th>待复核</th><th>已退回</th><th>活跃升级单</th><th>最大逾期天数</th><th></th>
+  </tr></thead><tbody></tbody></table>
+
+  <div id="threshold-box" style="display:none" class="card">
+    <strong>配置地区升级阈值</strong>
+    <div class="row">
+      <select id="th-code" onchange="fillThreshold()"></select>
+      <label>响应时限 <input id="th-response" type="number" style="width:80px" readonly></label>
+      <label>延期上限 <input id="th-ext" type="number" min="0" max="180" style="width:80px"></label>
+      <label>超期后升级阈值(天) <input id="th-escalation" type="number" min="0" max="180" style="width:80px"></label>
+      <label><input id="th-minor" type="checkbox"> 未成年人需监护人</label>
+      <label><input id="th-agent" type="checkbox"> 代理需授权</label>
+      <button onclick="saveThreshold()">保存阈值</button>
+    </div>
+    <div class="muted">阈值含义：响应期限届满后再宽限的天数；逾期天数 &gt; 阈值时，未结束请求自动进入升级队列（0 = 超期即升级）。</div>
+  </div>
+
+  <h2>升级队列</h2>
+  <div class="row">
+    <label><input id="include-closed" type="checkbox" onchange="loadEscalations()"> 含已关闭记录（可追溯）</label>
+    <button class="secondary" onclick="loadAll()">刷新</button>
+    <span id="esc-total" class="muted"></span>
+  </div>
+  <table id="escalations"><thead><tr>
+    <th>#</th><th>请求 / 主体</th><th>类型</th><th>地区</th><th>状态</th><th>响应到期日</th>
+    <th>逾期天数</th><th>处理人</th><th>责任人 / 计划完成日</th><th>操作</th>
+  </tr></thead><tbody></tbody></table>
+
+  <div id="detail"></div>
+</div>
+
+<div id="view-queue" class="view">
+  <h2>处理队列</h2>
+  <table id="requests"><thead><tr>
+    <th>请求号</th><th>类型</th><th>地区</th><th>状态</th><th>到期日</th><th>逾期</th><th>处理人</th><th>升级</th>
+  </tr></thead><tbody></tbody></table>
+  <h2>数据定位</h2>
+  <table id="locations"><thead><tr>
+    <th>请求</th><th>系统</th><th>类别</th><th>状态</th><th>法律保留</th>
+  </tr></thead><tbody></tbody></table>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=v=>String(v??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const STATUS_LABEL={open:'待处置',awaiting_review:'待复核',returned:'已退回',closed:'已关闭'};
+let summaryData=null, escRows=[], activeByRequest=new Map(), jurisdictions=[];
+
+function auth(){return {user:$('#user').value.trim()||'viewer',role:$('#role').value}}
+function saveAuth(){localStorage.setItem('esc-user',$('#user').value);localStorage.setItem('esc-role',$('#role').value)}
+async function api(path,opts={}){
+  const a=auth();opts.headers=Object.assign({'Content-Type':'application/json','X-User':a.user,'X-Role':a.role},opts.headers);
+  const res=await fetch(path,opts);const d=await res.json().catch(()=>({}));
+  if(!res.ok)throw new Error(d.error||('HTTP '+res.status));
+  return d;
+}
+function isSupervisor(){return auth().role==='supervisor'}
+
+function showTab(t){
+  $('#view-esc').classList.toggle('active',t==='esc');$('#view-queue').classList.toggle('active',t==='queue');
+  $('#tab-esc').classList.toggle('active',t==='esc');$('#tab-queue').classList.toggle('active',t==='queue');
+}
+
+async function loadAll(){
+  if(isSupervisor()){ $('#threshold-box').style.display='block'; await loadJurisdictions(); }
+  else $('#threshold-box').style.display='none';
+  await loadSummary();
+  await loadEscalations();
+  await loadQueue();
+}
+async function loadJurisdictions(){
+  const d=await api('/api/state');jurisdictions=d.jurisdictions||[];
+  $('#th-code').innerHTML=jurisdictions.map(j=>`<option value="${esc(j.code)}">${esc(j.code)} ${esc(j.name)}</option>`).join('');
+  fillThreshold();
+}
+function fillThreshold(){
+  const j=jurisdictions.find(x=>x.code===$('#th-code').value);if(!j)return;
+  $('#th-response').value=j.response_days;$('#th-ext').value=j.max_extension_days;
+  $('#th-escalation').value=j.escalation_threshold_days??0;
+  $('#th-minor').checked=!!j.minor_guardian_required;$('#th-agent').checked=!!j.agent_authority_required;
+}
+async function saveThreshold(){
+  const j=jurisdictions.find(x=>x.code===$('#th-code').value);
+  try{
+    await api('/api/jurisdictions',{method:'POST',body:JSON.stringify({
+      code:j.code,name:j.name,response_days:Number($('#th-response').value),
+      max_extension_days:Number($('#th-ext').value),
+      escalation_threshold_days:Number($('#th-escalation').value),
+      minor_guardian_required:$('#th-minor').checked,agent_authority_required:$('#th-agent').checked})});
+    await loadAll();
+  }catch(e){alert(e.message)}
+}
+
+async function loadSummary(){
+  try{summaryData=await api('/api/escalations/summary')}catch(e){summaryData=null;return}
+  $('#regions tbody').innerHTML=summaryData.regions.map(r=>`<tr>
+    <td>${esc(r.jurisdiction)} ${esc(r.name)}</td><td>${r.response_days}</td>
+    <td><strong>${r.escalation_threshold_days}</strong></td>
+    <td class="${r.overdue_open_request_count?'overdue':''}">${r.overdue_open_request_count}</td>
+    <td>${r.open_count}</td><td>${r.awaiting_review_count}</td><td>${r.returned_count}</td>
+    <td><strong>${r.active_count}</strong></td>
+    <td class="${r.max_overdue_days?'overdue':''}">${r.max_overdue_days}</td>
+    <td>${isSupervisor()?`<button class="secondary" onclick="editThreshold('${esc(r.jurisdiction)}')">改阈值</button>`:''}</td>
+  </tr>`).join('');
+}
+function editThreshold(code){$('#th-code').value=code;fillThreshold();$('#threshold-box').scrollIntoView({behavior:'smooth'})}
+
+async function loadEscalations(){
+  const q=$('#include-closed').checked&&(isSupervisor()||auth().role==='auditor')?'?include_closed=1':'';
+  try{escRows=(await api('/api/escalations'+q)).escalations||[]}catch(e){escRows=[];alert(e.message);return}
+  activeByRequest=new Map(escRows.filter(e=>e.status!=='closed').map(e=>[e.request_id,e]));
+  $('#esc-total').textContent=`活跃升级单 ${summaryData?summaryData.total_active:''}，已关闭 ${summaryData?summaryData.total_closed:''}`;
+  $('#escalations tbody').innerHTML=escRows.map(e=>{
+    const badge='b-'+(e.status==='awaiting_review'?'review':e.status);
+    return `<tr class="clickable" onclick="showDetail(${e.id})">
+      <td>${e.id}</td>
+      <td>${esc(e.request_no)}<br><span class="muted">${esc(e.subject_ref)}</span></td>
+      <td>${esc(e.request_type)}</td><td>${esc(e.jurisdiction)}</td>
+      <td><span class="badge ${badge}">${esc(e.status_label)}</span></td>
+      <td>${esc(e.due_date)}</td>
+      <td class="${e.current_overdue_days>0?'overdue':''}">${e.current_overdue_days} 天</td>
+      <td>${esc(e.assigned_to||'未指派')}</td>
+      <td>${e.responsible_party?esc(e.responsible_party)+'<br><span class="muted">'+esc(e.planned_completion_date)+'</span>':'—'}</td>
+      <td onclick="event.stopPropagation()">${rowAction(e)}</td>
+    </tr>`}).join('') || `<tr><td colspan="10" class="muted">暂无升级单（打开本页时会自动扫描超期请求）</td></tr>`;
+}
+function rowAction(e){
+  const a=auth();
+  if(e.status==='closed')return '<span class="muted">已关闭</span>';
+  if(e.status==='awaiting_review'&&isSupervisor())
+    return `<button class="secondary" onclick="showDetail(${e.id})">复核</button>`;
+  if((e.status==='open'||e.status==='returned')&&(a.role==='privacy_officer'||isSupervisor()))
+    return `<button class="secondary" onclick="showDetail(${e.id})">处置</button>`;
+  return `<button class="secondary" onclick="showDetail(${e.id})">查看</button>`;
+}
+
+async function showDetail(id){
+  let d;try{d=await api('/api/escalations/'+id)}catch(e){alert(e.message);return}
+  const f=(label,v)=>`<div><span class="muted">${label}：</span>${v}</div>`;
+  let forms='';
+  if(d.status==='open'||d.status==='returned'){
+    forms=`<h3>提交处置说明（内容不全不能提交）</h3>
+      <div class="row"><label style="flex:1">处置说明<textarea id="d-note">${esc(d.disposition_note||'')}</textarea></label></div>
+      <div class="row">
+        <label>责任人 <input id="d-party" value="${esc(d.responsible_party||'')}"></label>
+        <label>计划完成日 <input id="d-date" type="date" value="${esc(d.planned_completion_date||'')}"></label>
+        <button onclick="submitDisposition(${id},${d.version})">提交处置</button>
+      </div>`;
+  }
+  if(d.status==='awaiting_review'&&isSupervisor()){
+    forms=`<h3>主管复核</h3>
+      <div class="row"><label style="flex:1">复核意见（必填）<textarea id="r-note"></textarea></label></div>
+      <div class="row">
+        <button onclick="review(${id},${d.version},'close')">复核关闭（移出队列）</button>
+        <button class="secondary" onclick="review(${id},${d.version},'return')">退回补充处置</button>
+      </div>`;
+  }
+  const events=d.events.map(ev=>`<div class="ev">${esc(ev.created_at)} · <strong>${esc(ev.actor)}</strong> · ${esc(ev.action)}<br><span class="muted">${esc(ev.details)}</span></div>`).join('');
+  const tl=d.request_timeline.map(ev=>`<div class="ev">${esc(ev.created_at)} · ${esc(ev.actor)} · ${esc(ev.action)}<br><span class="muted">${esc(ev.details)}</span></div>`).join('');
+  $('#detail').style.display='block';
+  $('#detail').innerHTML=`
+    <h2>升级单 #${d.id} <span class="badge b-${d.status==='awaiting_review'?'review':d.status}">${esc(d.status_label)}</span></h2>
+    <div class="row" style="gap:26px">
+      ${f('请求',esc(d.request_no)+' ('+esc(d.subject_ref)+')')}
+      ${f('地区',esc(d.jurisdiction))}
+      ${f('请求状态',esc(d.request_status)+(d.request_open?' 未结束':' 已结束'))}
+      ${f('响应到期日',esc(d.due_date))}
+      ${f('当前逾期','<span class="'+(d.current_overdue_days?'overdue':'')+'">'+d.current_overdue_days+' 天</span>')}
+      ${f('处理人',esc(d.assigned_to||'未指派'))}
+    </div>
+    ${d.disposition_note?`<div class="card"><strong>处置说明：</strong>${esc(d.disposition_note)}
+      <div class="muted">责任人 ${esc(d.responsible_party)} ｜ 计划完成日 ${esc(d.planned_completion_date)} ｜ ${esc(d.submitted_by)} 于 ${esc(d.submitted_at)} 提交</div></div>`:''}
+    ${d.review_note?`<div class="card"><strong>复核意见：</strong>${esc(d.review_note)}
+      <div class="muted">${esc(d.reviewed_by)} 于 ${esc(d.reviewed_at)} 复核${d.status==='closed'?' · '+esc(d.closed_at)+' 关闭':''}</div></div>`:''}
+    ${forms}
+    <h3>升级记录</h3><div class="timeline">${events||'<span class="muted">无</span>'}</div>
+    <h3>请求时间线</h3><div class="timeline">${tl||'<span class="muted">无</span>'}</div>`;
+  $('#detail').scrollIntoView({behavior:'smooth'});
+}
+async function submitDisposition(id,version){
+  try{
+    await api('/api/escalations/disposition',{method:'POST',body:JSON.stringify({
+      escalation_id:id,expected_version:version,disposition_note:$('#d-note').value,
+      responsible_party:$('#d-party').value,planned_completion_date:$('#d-date').value})});
+    await loadAll();showDetail(id);
+  }catch(e){alert(e.message)}
+}
+async function review(id,version,action){
+  const note=$('#r-note').value;
+  try{
+    await api('/api/escalations/review',{method:'POST',body:JSON.stringify({
+      escalation_id:id,expected_version:version,action,review_note:note})});
+    await loadAll();
+    if(action==='close')$('#detail').style.display='none';else showDetail(id);
+  }catch(e){alert(e.message)}
+}
+
+async function loadQueue(){
+  let d;try{d=await api('/api/state')}catch(e){return}
+  $('#requests tbody').innerHTML=d.requests.map(r=>{
+    const active=activeByRequest.get(r.id);
+    let escCell='—';
+    if(active)escCell=`<button class="secondary" onclick="showTab('esc');showDetail(${active.id})">#${active.id}</button>`;
+    else if(r.overdue&&(auth().role==='supervisor'||auth().role==='privacy_officer'))
+      escCell=`<button onclick="manualEscalate(${r.id})">送升级</button>`;
+    return `<tr class="${r.overdue?'overdue':''}"><td>${esc(r.request_no)}</td><td>${esc(r.request_type)}</td>
+      <td>${esc(r.jurisdiction)}</td><td>${esc(r.status)}</td><td>${esc(r.due_date)}</td>
+      <td>${r.overdue?'已超期':''}</td><td>${esc(r.assigned_to||'')}</td><td>${escCell}</td></tr>`}).join('');
+  $('#locations tbody').innerHTML=d.locations.map(r=>`<tr><td>${r.request_id}</td><td>${esc(r.system_name)}</td>
+    <td>${esc(r.data_category)}</td><td>${esc(r.status)}</td><td>${r.legal_hold?'是':'否'}</td></tr>`).join('');
+}
+async function manualEscalate(rid){
+  try{await api('/api/escalations/open',{method:'POST',body:JSON.stringify({request_id:rid})});await loadAll()}
+  catch(e){alert(e.message)}
+}
+
+$('#user').value=localStorage.getItem('esc-user')||'sup1';
+$('#role').value=localStorage.getItem('esc-role')||'supervisor';
+loadAll();
+</script>
+</html>

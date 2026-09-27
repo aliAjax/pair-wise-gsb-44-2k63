@@ -17,6 +17,13 @@ DEFAULT_DB = ROOT / "privacy_requests.db"
 REQUEST_TYPES = {"access", "correction", "deletion", "withdraw_consent", "restriction"}
 OPEN_STATUSES = {"received", "verifying", "processing", "extended", "response_ready"}
 FINAL_STATUSES = {"fulfilled", "rejected", "duplicate"}
+ESCALATION_ACTIVE_STATUSES = ("open", "awaiting_review", "returned")
+ESCALATION_STATUS_LABELS = {
+    "open": "待处置",
+    "awaiting_review": "待复核",
+    "returned": "已退回",
+    "closed": "已关闭",
+}
 
 
 class DomainError(Exception):
@@ -76,6 +83,7 @@ class PrivacyRequestService:
                     name TEXT NOT NULL,
                     response_days INTEGER NOT NULL,
                     max_extension_days INTEGER NOT NULL,
+                    escalation_threshold_days INTEGER NOT NULL DEFAULT 0,
                     minor_guardian_required INTEGER NOT NULL,
                     agent_authority_required INTEGER NOT NULL,
                     updated_by TEXT NOT NULL,
@@ -138,10 +146,50 @@ class PrivacyRequestService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS escalations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id INTEGER NOT NULL REFERENCES requests(id),
+                    jurisdiction TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    overdue_days INTEGER NOT NULL DEFAULT 0,
+                    escalated_at TEXT NOT NULL,
+                    escalated_by TEXT NOT NULL,
+                    disposition_note TEXT,
+                    responsible_party TEXT,
+                    planned_completion_date TEXT,
+                    submitted_at TEXT,
+                    submitted_by TEXT,
+                    review_note TEXT,
+                    reviewed_at TEXT,
+                    reviewed_by TEXT,
+                    closed_at TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS escalation_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    escalation_id INTEGER NOT NULL REFERENCES escalations(id),
+                    request_id INTEGER NOT NULL REFERENCES requests(id),
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    details TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_requests_due ON requests(status,due_date);
                 CREATE INDEX IF NOT EXISTS idx_requests_subject ON requests(subject_id,request_type,submitted_at);
+                CREATE INDEX IF NOT EXISTS idx_escalations_status ON escalations(status,jurisdiction);
+                CREATE INDEX IF NOT EXISTS idx_escalation_events ON escalation_events(escalation_id,id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_escalation_open_request
+                    ON escalations(request_id)
+                    WHERE status IN ('open','awaiting_review','returned');
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(jurisdictions)").fetchall()}
+        if "escalation_threshold_days" not in cols:
+            conn.execute("ALTER TABLE jurisdictions ADD COLUMN escalation_threshold_days INTEGER NOT NULL DEFAULT 0")
 
     def _audit(self, conn: sqlite3.Connection, request_id: int | None, actor: str,
                action: str, details: dict[str, Any]) -> None:
@@ -153,26 +201,33 @@ class PrivacyRequestService:
     def configure_jurisdiction(self, actor: str, role: str, code: str, name: str,
                                response_days: int, max_extension_days: int,
                                minor_guardian_required: bool = True,
-                               agent_authority_required: bool = True) -> dict[str, Any]:
+                               agent_authority_required: bool = True,
+                               escalation_threshold_days: int = 0) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "配置地区规则")
         code, name = code.strip().upper(), name.strip()
         try:
             response_days, max_extension_days = int(response_days), int(max_extension_days)
+            escalation_threshold_days = int(escalation_threshold_days)
         except (TypeError, ValueError) as exc:
             raise DomainError("时限必须是整数") from exc
         if not code or not name or not 1 <= response_days <= 180 or not 0 <= max_extension_days <= 180:
             raise DomainError("地区规则参数无效")
+        if not 0 <= escalation_threshold_days <= 180:
+            raise DomainError("升级阈值必须在0到180天之间")
         with self.connect() as conn:
             conn.execute(
-                """INSERT INTO jurisdictions(code,name,response_days,max_extension_days,minor_guardian_required,agent_authority_required,updated_by,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?)
+                """INSERT INTO jurisdictions(code,name,response_days,max_extension_days,escalation_threshold_days,minor_guardian_required,agent_authority_required,updated_by,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(code) DO UPDATE SET name=excluded.name,response_days=excluded.response_days,
-                   max_extension_days=excluded.max_extension_days,minor_guardian_required=excluded.minor_guardian_required,
+                   max_extension_days=excluded.max_extension_days,escalation_threshold_days=excluded.escalation_threshold_days,
+                   minor_guardian_required=excluded.minor_guardian_required,
                    agent_authority_required=excluded.agent_authority_required,updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
-                (code, name, response_days, max_extension_days, int(bool(minor_guardian_required)), int(bool(agent_authority_required)), actor, utcnow()),
+                (code, name, response_days, max_extension_days, escalation_threshold_days,
+                 int(bool(minor_guardian_required)), int(bool(agent_authority_required)), actor, utcnow()),
             )
-            self._audit(conn, None, actor, "jurisdiction.configured", {"code": code})
+            self._audit(conn, None, actor, "jurisdiction.configured",
+                        {"code": code, "escalation_threshold_days": escalation_threshold_days})
             return dict(conn.execute("SELECT * FROM jurisdictions WHERE code=?", (code,)).fetchone())
 
     def create_subject(self, actor: str, role: str, subject_ref: str, region: str,
@@ -454,6 +509,307 @@ class PrivacyRequestService:
             self._audit(conn, request_id, actor, "request.rejected", {"reason": reason.strip()})
             return dict(self._request(conn, request_id))
 
+    # ---- 超期升级台 ----
+
+    def _escalation_event(self, conn: sqlite3.Connection, escalation_id: int, request_id: int,
+                          actor: str, action: str, details: dict[str, Any]) -> None:
+        conn.execute(
+            "INSERT INTO escalation_events(escalation_id,request_id,actor,action,details,created_at) VALUES(?,?,?,?,?,?)",
+            (escalation_id, request_id, actor, action,
+             json.dumps(details, ensure_ascii=False, sort_keys=True), utcnow()),
+        )
+
+    @staticmethod
+    def _overdue_days(due_date: str, now_dt: datetime) -> int:
+        delta = (now_dt - parse_time(due_date)).total_seconds()
+        return max(0, int(delta // 86400))
+
+    def _sweep_escalations(self, conn: sqlite3.Connection, actor: str = "system") -> int:
+        """把超过地区升级阈值且仍未结束、又没有未关闭升级单的请求幂等地送入升级队列。"""
+        now_dt = datetime.now(timezone.utc)
+        created = 0
+        requests = conn.execute(
+            "SELECT * FROM requests WHERE status IN ('received','verifying','processing','extended','response_ready') ORDER BY due_date,id"
+        ).fetchall()
+        for req in requests:
+            jurisdiction = conn.execute(
+                "SELECT escalation_threshold_days FROM jurisdictions WHERE code=?", (req["jurisdiction"],)
+            ).fetchone()
+            threshold = jurisdiction["escalation_threshold_days"] if jurisdiction else 0
+            overdue_days = self._overdue_days(req["due_date"], now_dt)
+            if overdue_days <= threshold:
+                continue
+            active = conn.execute(
+                """SELECT id FROM escalations WHERE request_id=?
+                   AND status IN ('open','awaiting_review','returned')""",
+                (req["id"],),
+            ).fetchone()
+            if active:
+                conn.execute("UPDATE escalations SET overdue_days=? WHERE id=?", (overdue_days, active["id"]))
+                continue
+            # 已有历史升级单（含已关闭）的请求复发时不自动重开，需手动提交新升级单
+            any_prior = conn.execute("SELECT 1 FROM escalations WHERE request_id=? LIMIT 1", (req["id"],)).fetchone()
+            if any_prior:
+                continue
+            now = utcnow()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO escalations(request_id,jurisdiction,status,overdue_days,escalated_at,escalated_by,updated_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (req["id"], req["jurisdiction"], "open", overdue_days, now, actor, now),
+                )
+            except sqlite3.IntegrityError:
+                continue  # 同一请求已有未关闭升级单（并发扫描）
+            escalation_id = cur.lastrowid
+            self._escalation_event(conn, escalation_id, req["id"], actor, "escalation.opened",
+                                   {"overdue_days": overdue_days, "threshold_days": threshold})
+            self._audit(conn, req["id"], actor, "escalation.opened",
+                        {"escalation_id": escalation_id, "overdue_days": overdue_days,
+                         "threshold_days": threshold})
+            created += 1
+        return created
+
+    def open_escalation(self, actor: str, role: str, request_id: int) -> dict[str, Any]:
+        """主管/处理人手动把一个已超过地区升级阈值的请求送入升级队列。"""
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor", "privacy_officer"}, "提交超期升级单")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            req = self._request(conn, request_id)
+            if role == "privacy_officer" and req["assigned_to"] != actor:
+                raise DomainError("只有被指派的处理人可以提交升级单", 403)
+            active = conn.execute(
+                """SELECT * FROM escalations WHERE request_id=?
+                   AND status IN ('open','awaiting_review','returned')""",
+                (request_id,),
+            ).fetchone()
+            if active:
+                raise DomainError("该请求已有未关闭的升级单，不能重复提交", 409)
+            jurisdiction = conn.execute("SELECT * FROM jurisdictions WHERE code=?", (req["jurisdiction"],)).fetchone()
+            if req["status"] not in OPEN_STATUSES:
+                raise DomainError("请求已经结束，不需要升级", 409)
+            threshold = jurisdiction["escalation_threshold_days"] if jurisdiction else 0
+            overdue_days = self._overdue_days(req["due_date"], datetime.now(timezone.utc))
+            if overdue_days <= threshold:
+                raise DomainError("未超过地区升级阈值，暂不进入升级队列", 409)
+            now = utcnow()
+            cur = conn.execute(
+                """INSERT INTO escalations(request_id,jurisdiction,status,overdue_days,escalated_at,escalated_by,updated_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (request_id, req["jurisdiction"], "open", overdue_days, now, actor, now),
+            )
+            escalation_id = cur.lastrowid
+            self._escalation_event(conn, escalation_id, request_id, actor, "escalation.opened",
+                                   {"overdue_days": overdue_days, "threshold_days": threshold, "manual": True})
+            self._audit(conn, request_id, actor, "escalation.opened",
+                        {"escalation_id": escalation_id, "overdue_days": overdue_days,
+                         "threshold_days": threshold, "manual": True})
+            return dict(conn.execute("SELECT * FROM escalations WHERE id=?", (escalation_id,)).fetchone())
+
+    def _esc_visible(self, conn: sqlite3.Connection, actor: str, role: str) -> str:
+        if role in {"supervisor", "auditor"}:
+            return ""
+        if role == "privacy_officer":
+            return " AND r.assigned_to=?"
+        return " AND 0"
+
+    def _esc_query(self, conn: sqlite3.Connection, actor: str, role: str, where: str, params: list[Any]) -> list[sqlite3.Row]:
+        sql = (
+            "SELECT e.*, r.request_no, r.request_type, r.status AS request_status, r.due_date, "
+            "r.assigned_to, s.subject_ref FROM escalations e "
+            "JOIN requests r ON r.id=e.request_id "
+            "JOIN data_subjects s ON s.id=r.subject_id " + where + self._esc_visible(conn, actor, role)
+            + " ORDER BY e.status DESC, e.jurisdiction, r.due_date, e.id"
+        )
+        if role == "privacy_officer":
+            params.append(actor)
+        return conn.execute(sql, params).fetchall()
+
+    def _decorate_escalation(self, row: sqlite3.Row, now_dt: datetime) -> dict[str, Any]:
+        item = dict(row)
+        item["status_label"] = ESCALATION_STATUS_LABELS.get(item["status"], item["status"])
+        item["current_overdue_days"] = self._overdue_days(item["due_date"], now_dt)
+        item["request_open"] = item["request_status"] in OPEN_STATUSES
+        return item
+
+    def escalation_queue(self, actor: str, role: str, include_closed: bool = False) -> list[dict[str, Any]]:
+        actor = clean_actor(actor)
+        now_dt = datetime.now(timezone.utc)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._sweep_escalations(conn)
+            if include_closed and role in {"supervisor", "auditor"}:
+                where, params = "WHERE 1=1", []
+            else:
+                placeholders = ",".join("?" for _ in ESCALATION_ACTIVE_STATUSES)
+                where, params = "WHERE e.status IN (%s)" % placeholders, list(ESCALATION_ACTIVE_STATUSES)
+            rows = self._esc_query(conn, actor, role, where, params)
+            return [self._decorate_escalation(row, now_dt) for row in rows]
+
+    def escalation_summary(self, actor: str, role: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        now_dt = datetime.now(timezone.utc)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._sweep_escalations(conn)
+            jurisdictions = conn.execute("SELECT * FROM jurisdictions ORDER BY code").fetchall()
+            rows = self._esc_query(conn, actor, role, "WHERE 1=1", [])
+            active = [r for r in rows if r["status"] in ESCALATION_ACTIVE_STATUSES]
+
+            overdue_open_requests: dict[str, list[int]] = {}
+            if role in {"supervisor", "auditor"}:
+                open_rows = conn.execute(
+                    "SELECT id,jurisdiction,due_date FROM requests WHERE status IN ('received','verifying','processing','extended','response_ready')"
+                ).fetchall()
+            elif role == "privacy_officer":
+                open_rows = conn.execute(
+                    "SELECT id,jurisdiction,due_date FROM requests WHERE status IN ('received','verifying','processing','extended','response_ready') AND assigned_to=?",
+                    (actor,),
+                ).fetchall()
+            else:
+                open_rows = []
+            for r in open_rows:
+                if self._overdue_days(r["due_date"], now_dt) > 0:
+                    overdue_open_requests.setdefault(r["jurisdiction"], []).append(r["id"])
+
+            regions = []
+            for j in jurisdictions:
+                code = j["code"]
+                esc = [r for r in active if r["jurisdiction"] == code]
+                regions.append({
+                    "jurisdiction": code,
+                    "name": j["name"],
+                    "response_days": j["response_days"],
+                    "escalation_threshold_days": j["escalation_threshold_days"],
+                    "active_count": len(esc),
+                    "open_count": sum(1 for r in esc if r["status"] == "open"),
+                    "awaiting_review_count": sum(1 for r in esc if r["status"] == "awaiting_review"),
+                    "returned_count": sum(1 for r in esc if r["status"] == "returned"),
+                    "overdue_open_request_count": len(overdue_open_requests.get(code, [])),
+                    "max_overdue_days": max((self._overdue_days(r["due_date"], now_dt) for r in esc), default=0),
+                })
+            return {
+                "regions": regions,
+                "total_active": len(active),
+                "total_overdue_open_requests": sum(len(v) for v in overdue_open_requests.values()),
+                "total_closed": sum(1 for r in rows if r["status"] == "closed"),
+            }
+
+    def get_escalation(self, actor: str, role: str, escalation_id: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT e.*, r.request_no, r.request_type, r.status AS request_status, r.due_date, "
+                "r.assigned_to, r.subject_id, s.subject_ref, s.region FROM escalations e "
+                "JOIN requests r ON r.id=e.request_id JOIN data_subjects s ON s.id=r.subject_id WHERE e.id=?",
+                (escalation_id,),
+            ).fetchone()
+            if not row:
+                raise DomainError("升级单不存在", 404)
+            if role not in {"supervisor", "auditor"} and not (
+                role == "privacy_officer" and row["assigned_to"] == actor
+            ):
+                raise DomainError("无权查看该升级单", 403)
+            events = [dict(r) for r in conn.execute(
+                "SELECT * FROM escalation_events WHERE escalation_id=? ORDER BY id", (escalation_id,)).fetchall()]
+            timeline = [dict(r) for r in conn.execute(
+                "SELECT * FROM timeline WHERE request_id=? ORDER BY id", (row["request_id"],)).fetchall()]
+            result = self._decorate_escalation(row, datetime.now(timezone.utc))
+            result["events"] = events
+            result["request_timeline"] = timeline
+            return result
+
+    def submit_escalation_disposition(self, actor: str, role: str, escalation_id: int,
+                                      disposition_note: str, responsible_party: str,
+                                      planned_completion_date: str,
+                                      expected_version: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"privacy_officer", "supervisor"}, "提交升级处置说明")
+        disposition_note = (disposition_note or "").strip()
+        responsible_party = (responsible_party or "").strip()
+        planned_completion_date = (planned_completion_date or "").strip()
+        missing = [name for name, value in (
+            ("处置说明", disposition_note), ("责任人", responsible_party), ("计划完成日", planned_completion_date),
+        ) if not value]
+        if missing:
+            raise DomainError("内容不全，不能提交：缺少%s" % "、".join(missing))
+        try:
+            datetime.strptime(planned_completion_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise DomainError("计划完成日必须是 YYYY-MM-DD 格式") from exc
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            esc = conn.execute("SELECT * FROM escalations WHERE id=?", (escalation_id,)).fetchone()
+            if not esc:
+                raise DomainError("升级单不存在", 404)
+            if esc["status"] not in {"open", "returned"}:
+                raise DomainError("当前升级单状态不能提交处置", 409)
+            if esc["version"] != int(expected_version):
+                raise DomainError("升级单已变化，请刷新后重试", 409)
+            req = self._request(conn, esc["request_id"])
+            self._can_process(actor, role, req, "提交升级处置说明")
+            now = utcnow()
+            conn.execute(
+                """UPDATE escalations SET status='awaiting_review',disposition_note=?,responsible_party=?,
+                   planned_completion_date=?,submitted_at=?,submitted_by=?,version=version+1,updated_at=?
+                   WHERE id=? AND version=?""",
+                (disposition_note, responsible_party, planned_completion_date, now, actor, now,
+                 escalation_id, expected_version),
+            )
+            self._escalation_event(conn, escalation_id, esc["request_id"], actor, "disposition.submitted",
+                                   {"responsible_party": responsible_party,
+                                    "planned_completion_date": planned_completion_date,
+                                    "note": disposition_note})
+            self._audit(conn, esc["request_id"], actor, "escalation.disposition_submitted",
+                        {"escalation_id": escalation_id, "responsible_party": responsible_party,
+                         "planned_completion_date": planned_completion_date})
+            return dict(conn.execute("SELECT * FROM escalations WHERE id=?", (escalation_id,)).fetchone())
+
+    def review_escalation(self, actor: str, role: str, escalation_id: int, action: str,
+                         review_note: str, expected_version: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "复核升级单")
+        action = (action or "").strip().lower()
+        review_note = (review_note or "").strip()
+        if action not in {"close", "return"}:
+            raise DomainError("复核动作必须是 close 或 return")
+        if not review_note:
+            raise DomainError("复核意见不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            esc = conn.execute("SELECT * FROM escalations WHERE id=?", (escalation_id,)).fetchone()
+            if not esc:
+                raise DomainError("升级单不存在", 404)
+            if esc["status"] == "closed":
+                raise DomainError("升级单已经关闭", 409)
+            if esc["version"] != int(expected_version):
+                raise DomainError("升级单已变化，请刷新后重试", 409)
+            req = self._request(conn, esc["request_id"])
+            now = utcnow()
+            if action == "close":
+                if esc["status"] != "awaiting_review" and req["status"] in OPEN_STATUSES:
+                    raise DomainError("处理人尚未提交处置说明，不能关闭", 409)
+                conn.execute(
+                    """UPDATE escalations SET status='closed',review_note=?,reviewed_at=?,reviewed_by=?,
+                       closed_at=?,version=version+1,updated_at=? WHERE id=? AND version=?""",
+                    (review_note, now, actor, now, now, escalation_id, expected_version),
+                )
+                event_action, audit_action = "escalation.closed", "escalation.closed"
+            else:
+                if esc["status"] != "awaiting_review":
+                    raise DomainError("只能在处理人提交处置后退回", 409)
+                conn.execute(
+                    """UPDATE escalations SET status='returned',review_note=?,reviewed_at=?,reviewed_by=?,
+                       version=version+1,updated_at=? WHERE id=? AND version=?""",
+                    (review_note, now, actor, now, escalation_id, expected_version),
+                )
+                event_action, audit_action = "escalation.returned", "escalation.returned"
+            self._escalation_event(conn, escalation_id, esc["request_id"], actor, event_action,
+                                   {"review_note": review_note})
+            self._audit(conn, esc["request_id"], actor, audit_action,
+                        {"escalation_id": escalation_id, "review_note": review_note})
+            return dict(conn.execute("SELECT * FROM escalations WHERE id=?", (escalation_id,)).fetchone())
+
     def _visibility(self, actor: str, role: str, conn: sqlite3.Connection) -> list[sqlite3.Row]:
         if role in {"supervisor", "auditor"}:
             return conn.execute("SELECT * FROM requests ORDER BY due_date,id").fetchall()
@@ -560,6 +916,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, self.service.state(actor, role))
             elif path == "/api/queue":
                 self._send(200, {"queue": self.service.queue(actor, role)})
+            elif path == "/api/escalations":
+                include_closed = urlparse(self.path).query == "include_closed=1"
+                self._send(200, {"escalations": self.service.escalation_queue(actor, role, include_closed)})
+            elif path == "/api/escalations/summary":
+                self._send(200, self.service.escalation_summary(actor, role))
+            elif path.startswith("/api/escalations/"):
+                self._send(200, self.service.get_escalation(actor, role, int(path.split("/")[3])))
             elif path.startswith("/api/requests/"):
                 self._send(200, self.service.get_request(actor, role, int(path.split("/")[3])))
             else:
@@ -594,6 +957,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.fulfill_request(actor, role, **data)
             elif path == "/api/requests/reject":
                 result = self.service.reject_request(actor, role, **data)
+            elif path == "/api/escalations/open":
+                result = self.service.open_escalation(actor, role, **data)
+            elif path == "/api/escalations/disposition":
+                result = self.service.submit_escalation_disposition(actor, role, **data)
+            elif path == "/api/escalations/review":
+                result = self.service.review_escalation(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
